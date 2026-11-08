@@ -25,6 +25,7 @@ FIRST_RUN_LIMIT = 5  # 포털별 첫 실행에 보낼 최대 기사 수
 MAX_SEND_PER_RUN = 30  # 초과분은 다음 실행에서 전송
 NAVER_MAX_PAGES = 10  # 검색어당 최대 1,000건
 DAUM_MAX_PAGES = 10  # 검색어당 최대 약 100건
+NO_NEWS_MESSAGE = "관련 키워드로 최근 10분간 올라온 기사가 없네요 ㅠㅠ, 그냥 웹서핑이나 하시죠"
 
 # 앞뒤가 다른 글자와 붙은 '단독주택', '속보치', '특종보험' 등은 제외합니다.
 # 붙여 쓰는 언론 표현만 별도로 허용합니다.
@@ -322,6 +323,19 @@ def notice(state, key, message, now):
         save_state(state)
 
 
+def notify_no_news(state, now, sent, issues, recent_articles):
+    """정상 검색·전송 완료 후에만, 같은 10분 구간에는 한 번만 안내합니다."""
+    if sent or state["pending"] or issues or recent_articles:
+        return False
+    slot = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0).isoformat()
+    if state.get("last_empty_notice_slot") == slot:
+        return False
+    telegram(NO_NEWS_MESSAGE)
+    state["last_empty_notice_slot"] = slot
+    save_state(state)
+    return True
+
+
 def main():
     required = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET"]
     if os.getenv("TEST_ONLY", "false").lower() == "true":
@@ -339,9 +353,13 @@ def main():
         state["welcome_sent"] = True
         save_state(state)
     warnings, failures = [], []
+    recent_articles = False
     for source, collector in (("네이버", collect_naver), ("다음", collect_daum)):
         try:
             articles = collector(now, warnings)
+            recent_articles = recent_articles or any(
+                datetime.fromisoformat(a["published"]) >= now - timedelta(minutes=10)
+                for a in articles)
             enqueue(state, source, articles, now)
             save_state(state)
             print(f"{source}: 최근 기사 {len(articles)}건 확인")
@@ -355,6 +373,7 @@ def main():
     state["seen"] = {k: date for k, date in state["seen"].items() if date >= expiry}
     save_state(state)
     print(f"처리 완료 기사 {sent}건 / 다음 실행 대기 {len(state['pending'])}건")
+    notify_no_news(state, now, sent, failures + warnings, recent_articles)
     if failures or warnings:
         for message in warnings:
             print(message, file=sys.stderr)

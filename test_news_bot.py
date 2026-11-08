@@ -25,6 +25,71 @@ def page(title="전북 경찰 구조", date="3분 전"):
 
 
 class NewsBotTests(unittest.TestCase):
+    @patch("news_bot.save_state")
+    @patch("news_bot.telegram")
+    def test_no_news_once_per_slot_and_again_next_slot(self, sender, saver):
+        state = bot.fresh_state()
+        self.assertTrue(bot.notify_no_news(state, NOW, 0, [], False))
+        self.assertFalse(bot.notify_no_news(state, NOW + timedelta(minutes=9), 0, [], False))
+        self.assertTrue(bot.notify_no_news(state, NOW + timedelta(minutes=10), 0, [], False))
+        self.assertEqual(sender.call_count, 2)
+        sender.assert_called_with(bot.NO_NEWS_MESSAGE)
+        self.assertEqual(saver.call_count, 2)
+
+    @patch("news_bot.telegram")
+    def test_no_false_empty_message_with_news_pending_or_search_problem(self, sender):
+        for sent, issues, recent, pending in (
+                (1, [], False, {}), (0, ["검색 실패"], False, {}),
+                (0, ["조회 상한"], False, {}), (0, [], True, {}),
+                (0, [], False, {"queued": article(1)})):
+            state = bot.fresh_state()
+            state["pending"] = pending
+            self.assertFalse(bot.notify_no_news(state, NOW, sent, issues, recent))
+        sender.assert_not_called()
+
+    @patch("news_bot.save_state")
+    @patch("news_bot.telegram", side_effect=bot.BotError("전송 실패"))
+    def test_no_news_failed_send_remains_retryable(self, sender, saver):
+        state = bot.fresh_state()
+        with self.assertRaises(bot.BotError):
+            bot.notify_no_news(state, NOW, 0, [], False)
+        self.assertNotIn("last_empty_notice_slot", state)
+        saver.assert_not_called()
+
+    def test_main_empty_new_seen_recent_and_partial_failure(self):
+        cases = ("empty", "old_seen", "recent_seen", "new", "failure", "warning")
+        for case in cases:
+            with self.subTest(case=case):
+                state = bot.fresh_state()
+                state.update(welcome_sent=True, initialized=["네이버", "다음"])
+                items = [article(20 if case == "old_seen" else 1)] if case in (
+                    "old_seen", "recent_seen", "new") else []
+                if case.endswith("seen"):
+                    state["seen"][items[0]["id"]] = NOW.isoformat()
+                def naver(now, warnings):
+                    if case == "warning":
+                        warnings.append("조회 상한")
+                    return items
+                real_flush = bot.flush_pending
+                env = {name: "fake" for name in (
+                    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET")}
+                with patch.dict("os.environ", env, clear=True), \
+                        patch("news_bot.datetime", wraps=datetime) as clock, \
+                        patch("news_bot.load_state", return_value=state), \
+                        patch("news_bot.save_state"), patch("news_bot.time.sleep"), \
+                        patch("news_bot.collect_naver", side_effect=naver), \
+                        patch("news_bot.collect_daum", return_value=[],
+                              side_effect=bot.BotError("다음 검색 실패") if case == "failure" else None), \
+                        patch("news_bot.telegram") as sender, \
+                        patch("news_bot.flush_pending", side_effect=lambda s, n: real_flush(
+                            s, n, sender, lambda _: None)):
+                    clock.now.return_value = NOW
+                    self.assertEqual(bot.main(), 1 if case == "failure" else 0)
+                messages = [call.args[0] for call in sender.call_args_list]
+                self.assertEqual(bot.NO_NEWS_MESSAGE in messages, case in ("empty", "old_seen"))
+                if case == "new":
+                    self.assertTrue(any(m.startswith("[전북 뉴스") for m in messages))
+
     def test_important_markers_and_allowed_compounds(self):
         cases = {
             "[속보] 전북 화재": ["속보"],
