@@ -26,13 +26,37 @@ MAX_SEND_PER_RUN = 30  # 초과분은 다음 실행에서 전송
 NAVER_MAX_PAGES = 10  # 검색어당 최대 1,000건
 DAUM_MAX_PAGES = 10  # 검색어당 최대 약 100건
 
+# 앞뒤가 다른 글자와 붙은 '단독주택', '속보치', '특종보험' 등은 제외합니다.
+# 붙여 쓰는 언론 표현만 별도로 허용합니다.
+IMPORTANT_PATTERNS = {
+    "속보": re.compile(r"(?<!\w)(?:긴급속보|속보)(?!\w)"),
+    "단독": re.compile(r"(?<!\w)단독(?:보도|취재)?(?!\w)"),
+    "특종": re.compile(r"(?<!\w)특종(?:보도|취재)?(?!\w)"),
+}
+IMPORTANT_ICONS = {"속보": "🚨", "단독": "🔴", "특종": "⭐"}
+# 띄어 쓴 일반 표현도 제외합니다. [단독]처럼 명시한 기사 표시는 유지합니다.
+NON_NEWS_PHRASES = re.compile(
+    r"(?<!\w)단독\s+(?:주택|주거|가구|세대|명의|소유|상속|후보|입후보|출마|"
+    r"공천|추천|선두|1위|우승|승리|대표|대표이사|운영|경영|입찰|응찰|계약|"
+    r"개최|공연|콘서트|전시|전시회|출연|인터뷰|면담|회담|방문|행동|범행|"
+    r"사고|처리|심리|판사|재판부|재판)|(?<!\w)특종\s+보험"
+)
+
+
+def important_labels(title, summary=""):
+    """기존 전북 기사 필터를 통과한 제목·요약에서 중요 표시를 찾습니다."""
+    text = NON_NEWS_PHRASES.sub(" ", title + "\n" + summary)
+    return [label for label, pattern in IMPORTANT_PATTERNS.items() if pattern.search(text)]
+
 
 class BotError(Exception):
     """토큰이나 인증 URL을 포함하지 않는 사용자용 오류."""
 
 
 def clean(text):
-    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
+    # <단독>을 HTML 태그로 오인해 지우지 않습니다.
+    text = re.sub(r"<(속보|단독|특종)>", r"[\1]", text or "")
+    return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
 
 
 def canonical_url(url):
@@ -220,6 +244,9 @@ def load_state(path=STATE_PATH):
         for article in state["pending"].values():
             for key in ("id", "source", "title", "summary", "url", "published", "keywords"):
                 article[key]
+            for flag in ("normal_sent", "priority_sent"):
+                if flag in article and not isinstance(article[flag], bool):
+                    raise ValueError()
         return state
     except (ValueError, KeyError, TypeError):
         raise BotError("data/state.json이 손상되었습니다. 중복 발송 방지를 위해 중단합니다.") from None
@@ -256,16 +283,34 @@ def format_article(a):
             f"키워드: {', '.join(a['keywords'])}\n{a['url'][:1500]}")
 
 
+def format_priority(a, labels):
+    icons = "".join(IMPORTANT_ICONS[label] for label in labels)
+    return (f"{icons} [중요 알림 · {' / '.join(labels)}] {icons}\n"
+            f"{format_article(a)}")
+
+
 def flush_pending(state, now, sender=telegram, saver=save_state):
     sent = 0
-    for a in sorted(state["pending"].values(), key=lambda a: a["published"])[:MAX_SEND_PER_RUN]:
-        sender(format_article(a))
-        # 전송 성공 응답을 받은 기사만 처리 완료로 기록합니다.
+    # 중요한 기사부터 처리하되, 동일 등급에서는 오래된 기사부터 보냅니다.
+    ordered = sorted(state["pending"].values(), key=lambda a: (
+        not bool(important_labels(a["title"], a["summary"])), a["published"]))
+    for a in ordered[:MAX_SEND_PER_RUN]:
+        labels = important_labels(a["title"], a["summary"])
+        if labels and not a.get("priority_sent", False):
+            sender(format_priority(a, labels))
+            a["priority_sent"] = True
+            saver(state)
+            time.sleep(1.1)
+        if not a.get("normal_sent", False):
+            sender(format_article(a))
+            a["normal_sent"] = True
+            saver(state)
+            time.sleep(1.1)
+        # 각각의 성공을 저장한 뒤, 필요한 알림이 모두 끝난 기사를 완료 처리합니다.
         state["seen"][a["id"]] = now.isoformat()
         del state["pending"][a["id"]]
         saver(state)
         sent += 1
-        time.sleep(1.1)
     return sent
 
 
@@ -309,7 +354,7 @@ def main():
     expiry = (now - timedelta(days=30)).isoformat()
     state["seen"] = {k: date for k, date in state["seen"].items() if date >= expiry}
     save_state(state)
-    print(f"전송 {sent}건 / 다음 실행 대기 {len(state['pending'])}건")
+    print(f"처리 완료 기사 {sent}건 / 다음 실행 대기 {len(state['pending'])}건")
     if failures or warnings:
         for message in warnings:
             print(message, file=sys.stderr)

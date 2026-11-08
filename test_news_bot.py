@@ -25,6 +25,107 @@ def page(title="전북 경찰 구조", date="3분 전"):
 
 
 class NewsBotTests(unittest.TestCase):
+    def test_important_markers_and_allowed_compounds(self):
+        cases = {
+            "[속보] 전북 화재": ["속보"],
+            "【단독】전북 수사": ["단독"],
+            "전북 소식 (특종)": ["특종"],
+            "긴급속보 전북": ["속보"],
+            "전북 단독보도": ["단독"],
+            "전북 특종취재": ["특종"],
+            "[속보·단독] 전북": ["속보", "단독"],
+            "[단독] 주택 사업 의혹": ["단독"],
+        }
+        for title, expected in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(bot.important_labels(title), expected)
+
+    def test_important_false_positive_exclusions(self):
+        for phrase in ("단독주택", "단독 주택", "단독 후보", "단독 출마", "단독 선두",
+                       "단독 콘서트", "단독 인터뷰", "단독 사고", "단독으로 진행",
+                       "속보치", "고속보트", "특종보험", "특종 보험료", "단독 주택에서 화재"):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(bot.important_labels("전북 " + phrase), [])
+
+    def test_summary_detection_and_angle_brackets(self):
+        self.assertEqual(bot.important_labels("전북 소식", "단독 보도 내용입니다"), ["단독"])
+        a = bot.make_article("네이버", "<단독> 전북", "", "https://example.com/1", NOW, "전북")
+        self.assertEqual(bot.important_labels(a["title"]), ["단독"])
+        self.assertIsNone(bot.make_article("네이버", "[속보] 서울", "서울", "https://example.com/2", NOW, "전북"))
+
+    @patch("news_bot.time.sleep")
+    def test_important_extra_message_and_dedup(self, _):
+        state = bot.fresh_state()
+        a = dict(article(1), title="[속보·단독] 전북 수사")
+        bot.enqueue(state, "네이버", [a, a], NOW)
+        messages = []
+        self.assertEqual(bot.flush_pending(state, NOW, messages.append, lambda _: None), 1)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("🚨🔴 [중요 알림 · 속보 / 단독]", messages[0])
+        self.assertTrue(messages[1].startswith("[전북 뉴스"))
+        bot.enqueue(state, "네이버", [a], NOW)
+        bot.flush_pending(state, NOW, messages.append, lambda _: None)
+        self.assertEqual(len(messages), 2)
+
+    @patch("news_bot.time.sleep")
+    def test_important_retry_only_unsent_message_after_restart(self, _):
+        state = bot.fresh_state()
+        bot.enqueue(state, "네이버", [dict(article(1), title="[단독] 전북 수사")], NOW)
+        calls = []
+        def sender(message):
+            calls.append(message)
+            if len(calls) == 2:
+                raise bot.BotError("일반 알림 실패")
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "state.json"
+            bot.save_state(state, path)
+            with self.assertRaises(bot.BotError):
+                bot.flush_pending(state, NOW, sender, lambda s: bot.save_state(s, path))
+            restored = bot.load_state(path)
+            self.assertFalse(restored["seen"])
+            self.assertTrue(next(iter(restored["pending"].values()))["priority_sent"])
+            messages = []
+            bot.flush_pending(restored, NOW, messages.append, lambda s: bot.save_state(s, path))
+            self.assertEqual(messages, [calls[1]])
+            self.assertFalse(restored["pending"])
+
+    @patch("news_bot.time.sleep")
+    def test_important_failure_not_marked_delivered(self, _):
+        state = bot.fresh_state()
+        a = dict(article(1), title="[특종] 전북")
+        bot.enqueue(state, "네이버", [a], NOW)
+        with self.assertRaises(bot.BotError):
+            bot.flush_pending(state, NOW, lambda _: (_ for _ in ()).throw(bot.BotError("실패")), lambda _: None)
+        self.assertFalse(a.get("priority_sent", False))
+        self.assertFalse(state["seen"])
+
+    @patch("news_bot.time.sleep")
+    def test_completed_flags_do_not_resend(self, _):
+        state = bot.fresh_state()
+        a = dict(article(1), title="[단독] 전북", normal_sent=True, priority_sent=True)
+        bot.enqueue(state, "네이버", [a], NOW)
+        messages = []
+        bot.flush_pending(state, NOW, messages.append, lambda _: None)
+        self.assertFalse(messages)
+        self.assertIn(a["id"], state["seen"])
+
+    @patch("news_bot.time.sleep")
+    def test_legacy_state_and_important_priority(self, _):
+        state = bot.fresh_state()
+        state["initialized"] = ["네이버"]
+        state["seen"][article(5)["id"]] = NOW.isoformat()
+        bot.enqueue(state, "네이버", [article(3), dict(article(1), title="[속보] 전북"), article(5)], NOW)
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "state.json"
+            bot.save_state(state, path)
+            restored = bot.load_state(path)
+            messages = []
+            with patch("news_bot.MAX_SEND_PER_RUN", 1):
+                bot.flush_pending(restored, NOW, messages.append, lambda _: None)
+            self.assertIn("중요 알림", messages[0])
+            self.assertEqual(len(restored["pending"]), 1)
+            self.assertIn(article(5)["id"], restored["seen"])
+
     def test_duplicate_urls_and_keywords(self):
         state = bot.fresh_state()
         a = article(1)
