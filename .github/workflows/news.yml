@@ -1,0 +1,69 @@
+name: Jeonbuk News Bot
+
+on:
+  schedule:
+    - cron: '3-59/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_only:
+        description: '텔레그램 연결만 테스트 (기사 수집 안 함)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jeonbuk-news-bot
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 저장소와 전송 기록 가져오기
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Python 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 라이브러리 설치
+        run: python -m pip install -r requirements.txt
+      - name: 뉴스 수집과 텔레그램 전송
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          TEST_ONLY: ${{ inputs.test_only || 'false' }}
+        run: python news_bot.py
+      - name: 전송 기록 저장
+        if: always()
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          if [ ! -f data/state.json ]; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/state.json
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'Update news delivery state'
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$DEFAULT_BRANCH"
+            if git push origin "HEAD:$DEFAULT_BRANCH"; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo '전송 기록 저장 실패. 다음 실행에서 일부 기사가 중복될 수 있습니다.'
+          exit 1
